@@ -20,8 +20,21 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 try:
     import yfinance as yf
     HAS_YF = True
+    # Sessione condivisa con User-Agent realistico: riduce il rate limiting
+    # aggressivo che Yahoo applica ai client "anonimi" tipici dei server cloud.
+    try:
+        import requests as _requests
+        _yf_session = _requests.Session()
+        _yf_session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/124.0.0.0 Safari/537.36"
+        })
+    except ImportError:
+        _yf_session = None
 except ImportError:
     HAS_YF = False
+    _yf_session = None
     print("ATTENZIONE: yfinance non disponibile")
 
 try:
@@ -97,14 +110,40 @@ class MarketData:
         if not HAS_YF:
             self.errors.append("yfinance non disponibile")
             return
+
+        import time
+
         for name, sym in TICKERS.items():
-            try:
-                obj = yf.Ticker(sym)
-                df  = obj.history(period="5d", interval="5m")
-                if df is not None and len(df) > 20:
-                    self.prices[name] = df
-            except Exception as e:
-                self.errors.append(f"{name}: {e}")
+            success = False
+            last_error = None
+
+            # Fino a 3 tentativi con pausa crescente (2s, 5s, 10s)
+            for attempt, wait in enumerate([0, 2, 5, 10]):
+                if wait > 0:
+                    time.sleep(wait)
+                try:
+                    obj = yf.Ticker(sym, session=_yf_session) if _yf_session else yf.Ticker(sym)
+                    df  = obj.history(period="5d", interval="5m")
+                    if df is not None and len(df) > 20:
+                        self.prices[name] = df
+                        success = True
+                        break
+                    else:
+                        last_error = "dati vuoti"
+                except Exception as e:
+                    last_error = str(e)
+                    # Se è un rate limit, vale la pena riprovare con pausa più lunga
+                    if "Too Many Requests" in last_error or "rate limit" in last_error.lower():
+                        continue
+                    else:
+                        # Altri errori (es. ticker inesistente) non hanno senso da ritentare
+                        break
+
+            if not success:
+                self.errors.append(f"{name}: {last_error}")
+
+            # Piccola pausa tra un ticker e l'altro per non bombardare Yahoo
+            time.sleep(1.5)
 
     def _fetch_rss(self):
         if not HAS_FEED:
